@@ -5,8 +5,9 @@
 на сайте (method=getHomeNum). Запросы идут через fetch() внутри страницы, поэтому
 у них есть все куки WAF и CSRF-токен.
 
-Выход (stdout): {"updated", "dtek_update", "city", "partial",
-                  "streets": {"<улица>": {"<дом>": "3.1" | "3.1,4.2"}}}
+Выход (stdout): {"updated", "dtek_update", "city", "format": "city|street", "partial",
+                  "streets": {"<нас. пункт>|<улица>": {"<дом>": "3.1" | "3.1,4.2"}}}
+Обходятся все населённые пункты зоны ДТЕК Одеські ЕМ, Одесса первой.
 Диагностика — в stderr (видно в логе Actions).
 """
 import argparse
@@ -21,7 +22,7 @@ from playwright.async_api import async_playwright
 from dtek import URL, norm_group
 
 CITY_HINT = "Одес"
-CONCURRENCY = 3
+CONCURRENCY = 4
 PAUSE = 0.25          # пауза после каждого запроса, сек
 REOPEN_AFTER = 20     # столько ошибок подряд — заново открыть страницу (новые куки WAF)
 
@@ -59,22 +60,24 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
-def pick_streets(raw):
-    """streets бывает списком улиц, словарём улица→…, или словарём город→улицы."""
+def pick_targets(raw):
+    """Список (город, [улицы]). streets бывает списком улиц, словарём улица→… или словарём город→улицы.
+    Одесса идёт первой, дальше сёла и города области по алфавиту."""
     if isinstance(raw, list):
-        return None, [str(x) for x in raw]
+        return [(None, [str(x) for x in raw])]
     if not isinstance(raw, dict) or not raw:
-        return None, []
+        return []
     vals = list(raw.values())
-    is_city_map = sum(isinstance(v, (list, dict)) and len(v) > 5 for v in vals) > len(vals) / 2
+    is_city_map = sum(isinstance(v, (list, dict)) and len(v) > 0 for v in vals) > len(vals) / 2
     if not is_city_map:
-        return None, [str(k) for k in raw]
-    keys = sorted((k for k in raw if CITY_HINT in k), key=lambda k: (not k.startswith("м."), len(k)))
-    if not keys:
-        log("город с 'Одес' не найден, ключи:", list(raw)[:20])
-        return None, []
-    v = raw[keys[0]]
-    return keys[0], [str(x) for x in (v.keys() if isinstance(v, dict) else v)]
+        return [(None, [str(k) for k in raw])]
+    out = []
+    for city, v in raw.items():
+        streets = [str(x) for x in (v.keys() if isinstance(v, dict) else v)] if isinstance(v, (list, dict)) else []
+        if streets:
+            out.append((city, streets))
+    out.sort(key=lambda cs: (not (CITY_HINT in cs[0] and cs[0].startswith("м.")), cs[0]))
+    return out
 
 
 def parse(text):
@@ -101,7 +104,7 @@ def parse(text):
     return out
 
 
-async def crawl(headless: bool, limit: int) -> dict:
+async def crawl(headless: bool, limit: int, budget: int) -> dict:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=headless, args=["--disable-blink-features=AutomationControlled"])
@@ -122,31 +125,37 @@ async def crawl(headless: bool, limit: int) -> dict:
 
         meta = await open_page()
         raw = meta["streets"]
-        city, streets = pick_streets(raw)
-        log(f"streets: тип={type(raw).__name__} город={city!r} улиц={len(streets)} "
-            f"пример={streets[:3]} update={meta['update']!r} csrf={'да' if meta['csrf'] else 'нет'}")
-        if not streets:
+        targets = pick_targets(raw)
+        total = sum(len(st) for _, st in targets)
+        log(f"streets: тип={type(raw).__name__} населённых пунктов={len(targets)} улиц всего={total} "
+            f"первые={[c for c, _ in targets[:5]]} update={meta['update']!r} csrf={'да' if meta['csrf'] else 'нет'}")
+        if not targets:
             log("сырой streets (начало):", json.dumps(raw, ensure_ascii=False)[:1500])
             raise RuntimeError("список улиц пуст")
+        jobs = [(c, st) for c, sts in targets for st in sts]
         if limit:
-            streets = streets[:limit]
+            jobs = jobs[:limit]
 
-        args = lambda s: {"city": city, "street": s, "update": meta["update"], "csrf": meta["csrf"]}
+        args = lambda c, s: {"city": c, "street": s, "update": meta["update"], "csrf": meta["csrf"]}
 
         # пробный запрос — сырой ответ в лог, чтобы видеть формат
-        probe = await page.evaluate(JS_HOUSES, args(streets[0]))
-        log(f"проба {streets[0]!r}: HTTP {probe['status']} {probe['text'][:600]}")
+        probe = await page.evaluate(JS_HOUSES, args(*jobs[0]))
+        log(f"проба {jobs[0]!r}: HTTP {probe['status']} {probe['text'][:600]}")
 
-        result, fails = {}, []
+        result, fails, skipped = {}, [], []
         state = {"bad": 0, "done": 0}
         sem, reopen_lock = asyncio.Semaphore(CONCURRENCY), asyncio.Lock()
         t0 = time.time()
 
-        async def one(street):
+        async def one(city, street):
+            if time.time() - t0 > budget:
+                skipped.append(f"{city}|{street}")
+                return
+            key = f"{city}|{street}" if city else street
             for attempt in range(4):
                 async with sem:
                     try:
-                        r = await page.evaluate(JS_HOUSES, args(street))
+                        r = await page.evaluate(JS_HOUSES, args(city, street))
                     except Exception as e:
                         r = {"status": 0, "text": str(e)}
                     await asyncio.sleep(PAUSE)
@@ -154,7 +163,7 @@ async def crawl(headless: bool, limit: int) -> dict:
                 if houses is not None:
                     state["bad"] = 0
                     if houses:
-                        result[street] = houses
+                        result[key] = houses
                     break
                 state["bad"] += 1
                 if attempt == 0:
@@ -169,24 +178,26 @@ async def crawl(headless: bool, limit: int) -> dict:
                             state["bad"] = 0
                 await asyncio.sleep(5 * (attempt + 1))
             else:
-                fails.append(street)
+                fails.append(key)
             state["done"] += 1
             if state["done"] % 100 == 0:
-                log(f"{state['done']}/{len(streets)} улиц, {time.time() - t0:.0f} c")
+                log(f"{state['done']}/{len(jobs)} улиц, {time.time() - t0:.0f} c")
 
-        await asyncio.gather(*(one(s) for s in streets))
+        await asyncio.gather(*(one(c, st) for c, st in jobs))
         await browser.close()
 
     houses = sum(len(v) for v in result.values())
-    log(f"готово: улиц с домами {len(result)}, домов {houses}, неудач {len(fails)} {fails[:10]}")
+    log(f"готово: улиц с домами {len(result)}, домов {houses}, неудач {len(fails)} {fails[:10]}, не успели по времени {len(skipped)}")
     if not houses:
         raise RuntimeError("ни одного дома — формат ответа не распознан, см. «проба» выше")
     return {
         "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "dtek_update": meta["update"],
-        "city": city,
-        "partial": bool(limit) or len(fails) > len(streets) * 0.1,
+        "city": targets[0][0],
+        "format": "city|street",
+        "partial": bool(limit) or len(fails) > len(jobs) * 0.1,
         "failed": fails,
+        "skipped": len(skipped),
         "streets": dict(sorted(result.items())),
     }
 
@@ -195,6 +206,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="сколько улиц (0 = все)")
+    ap.add_argument("--budget", type=int, default=15000, help="секунд на обход, потом сохраняем что успели")
     a = ap.parse_args()
-    data = asyncio.run(crawl(headless=not a.headed, limit=a.limit))
+    data = asyncio.run(crawl(headless=not a.headed, limit=a.limit, budget=a.budget))
     json.dump(data, sys.stdout, ensure_ascii=False, separators=(",", ":"))
