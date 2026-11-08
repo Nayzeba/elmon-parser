@@ -1,0 +1,39 @@
+name: dtek-addresses
+on:
+  schedule:
+    - cron: "17 1 * * *"   # раз в сутки, ~03:17 по Одессе
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Сколько улиц обойти (0 = все, 20 = быстрый тест)"
+        default: "0"
+
+concurrency: { group: addresses, cancel-in-progress: false }
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r parser/requirements.txt
+      - name: Cache Chromium
+        uses: actions/cache@v4
+        with: { path: ~/.cache/ms-playwright, key: pw-1.48.0 }
+      - run: python -m playwright install --with-deps chromium
+      - name: Crawl addresses
+        working-directory: parser
+        run: xvfb-run -a python addresses.py --headed --limit "${{ inputs.limit || '0' }}" > ../addresses.json
+      - name: Compress
+        run: gzip -k -9 addresses.json && ls -la addresses.json*
+      - name: Push to elmon.arestov.net
+        run: |
+          curl -sS --fail -X POST "https://elmon.arestov.net/api/push_addresses.php" \
+            -H "X-Elmon-Token: ${{ secrets.ELMON_TOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @addresses.json.gz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: addresses, path: addresses.json, if-no-files-found: ignore }
