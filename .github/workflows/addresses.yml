@@ -13,7 +13,7 @@ concurrency: { group: addresses, cancel-in-progress: false }
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,7 +25,7 @@ jobs:
       - run: python -m playwright install --with-deps chromium
       - name: Crawl addresses
         working-directory: parser
-        run: xvfb-run -a python addresses.py --headed --limit "${{ inputs.limit || '0' }}" > ../addresses.json
+        run: xvfb-run -a python addresses.py --headed --limit "${{ inputs.limit || '0' }}" --budget 15600 > ../addresses.json
       - name: Compress
         run: gzip -k -9 addresses.json && ls -la addresses.json*
       - name: Push to elmon.arestov.net
